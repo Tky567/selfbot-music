@@ -1,0 +1,8 @@
+node_modules
+bin/ffmpeg
+bin/ffmpeg.exe
+bin/yt-dlp
+bin/yt-dlp.exe
+*.cmd
+.git
+.env
