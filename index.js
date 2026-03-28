@@ -21,16 +21,29 @@ const path = require('path');
 const fs = require('fs');
 
 const isWindows = process.platform === 'win32';
-process.env.FFMPEG_PATH = path.join(__dirname, 'bin', isWindows ? 'ffmpeg.exe' : 'ffmpeg');
+
+if (isWindows) {
+    process.env.FFMPEG_PATH = path.join(__dirname, 'bin', 'ffmpeg.exe');
+} else {
+    // On Linux, use system ffmpeg from PATH
+    try {
+        const systemFfmpeg = execSync('which ffmpeg', { timeout: 5000 }).toString().trim();
+        process.env.FFMPEG_PATH = systemFfmpeg;
+        console.log(`[Init] Using system ffmpeg: ${systemFfmpeg}`);
+    } catch {
+        // Fallback to bundled binary
+        process.env.FFMPEG_PATH = path.join(__dirname, 'bin', 'ffmpeg');
+        console.log('[Init] System ffmpeg not found, using bundled bin/ffmpeg');
+    }
+}
 const YTDLP_PATH = path.join(__dirname, 'bin', isWindows ? 'yt-dlp.exe' : 'yt-dlp');
 
 if (!isWindows) {
     try {
-        fs.chmodSync(process.env.FFMPEG_PATH, 0o755);
         fs.chmodSync(YTDLP_PATH, 0o755);
-        console.log('[Init] Granted execute permission for ffmpeg and yt-dlp');
+        console.log('[Init] Granted execute permission for yt-dlp');
     } catch (e) {
-        console.error('[Init] Cannot grant execute permission for binaries:', e.message);
+        console.error('[Init] Cannot grant execute permission for yt-dlp:', e.message);
     }
 }
 
@@ -124,8 +137,9 @@ async function ensureVoiceConnection(message, guildId, voiceChannelId) {
             guildId,
             channelId: voiceChannelId,
             adapterCreator: message.guild.voiceAdapterCreator,
-            selfDeaf: false,
+            selfDeaf: true,
             selfMute: false,
+            debug: true,
         });
     } else if (connection.joinConfig.channelId !== voiceChannelId) {
         try {
@@ -145,14 +159,22 @@ async function ensureVoiceConnection(message, guildId, voiceChannelId) {
                 adapterCreator: message.guild.voiceAdapterCreator,
                 selfDeaf: false,
                 selfMute: false,
+                debug: true,
             });
         }
     }
 
     activeConnection = connection;
-    await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+    await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
     return connection;
 }
+
+process.on('unhandledRejection', (err) => {
+    console.error('[UnhandledRejection]', err);
+});
+process.on('uncaughtException', (err) => {
+    console.error('[UncaughtException]', err);
+});
 
 const client = new Client();
 
@@ -414,6 +436,11 @@ async function startAudioPlayback(message, guildId, voiceChannelId, videoUrl) {
                 console.error('[yt-dlp stdout error]', err.message);
             }
         });
+        ffmpegProc.stdout.on('error', (err) => {
+            if (err && err.code !== 'EPIPE') {
+                console.error('[ffmpeg stdout error]', err.message);
+            }
+        });
 
         ytProc.stdout.pipe(ffmpegProc.stdin);
         ytProc.on('close', () => {
@@ -432,6 +459,31 @@ async function startAudioPlayback(message, guildId, voiceChannelId, videoUrl) {
         const resource = createAudioResource(ffmpegProc.stdout, {
             inputType: StreamType.OggOpus,
             inlineVolume: false,
+        });
+
+        // Handle voice connection errors and disconnects during playback
+        connection.on('error', (err) => {
+            console.error('[Voice Connection Error]', err.message);
+        });
+        connection.on('stateChange', async (oldState, newState) => {
+            if (sessionId !== activeSessionId) return;
+            if (newState.status === VoiceConnectionStatus.Disconnected) {
+                try {
+                    // Try to reconnect within 5 seconds
+                    await entersState(connection, VoiceConnectionStatus.Connecting, 5_000);
+                } catch {
+                    // If reconnect fails, clean up
+                    console.error('[Voice] Disconnected and could not reconnect, stopping playback.');
+                    if (sessionId === activeSessionId) {
+                        stopStreaming();
+                    }
+                }
+            } else if (newState.status === VoiceConnectionStatus.Destroyed) {
+                // Connection was destroyed externally
+                if (sessionId === activeSessionId) {
+                    stopStreaming();
+                }
+            }
         });
 
         // Wait for voice ready, then start playback immediately
